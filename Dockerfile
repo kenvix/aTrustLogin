@@ -31,8 +31,8 @@ RUN echo "Begin build" && \
     chmod +x /bin/start-with-autologin-actual.sh && \
     chmod +x /bin/start-port-forwarding.sh && \
     apt-get update && \
-    apt-get install -y apt-utils curl && \
-    apt-get install -y chromium chromium-driver chromium-l10n python3 python3-pip && \
+    apt-get install -y --no-install-recommends --no-install-suggests apt-utils curl x11-xserver-utils && \
+    apt-get install -y --no-install-recommends --no-install-suggests chromium chromium-driver chromium-l10n python3 python3-pip && \
     cd /opt/atrust-autologin && \
     pip3 install --break-system-packages -r requirements.txt && \
     apt-get clean && \
