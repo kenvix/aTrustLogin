@@ -15,7 +15,7 @@ while true; do
   # 执行命令
   python3 /opt/atrust-autologin/main.py --interactive=True --wait_atrust=True --driver_type=chrome \
   --data_dir="$HOME/.atrust-data" \
-  --driver_path=/usr/bin/chromedriver --browser_path=/usr/bin/chromium $ATRUST_OPTS
+  --driver_path=/usr/bin/chromedriver --browser_path=/usr/bin/chromium --container-mode=True $ATRUST_OPTS
 
   # 检查退出状态码
   if [ $? -eq 0 ]; then
