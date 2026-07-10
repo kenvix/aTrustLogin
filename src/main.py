@@ -36,7 +36,7 @@ class ATrustLogin:
         self.cookie_sig = cookie_sig
 
         self.must_be_logged_keywords = ['app_center', 'user_info', 'app_apply', 'device_manage']
-        self.must_not_logged_keywords = ['login', 'totpAuth', 'captcha']
+        # self.must_not_logged_keywords = ['login', 'totpAuth', 'captcha', 'page_auth_trust_terminal', 'smsAuth']
 
         if self.container_mode:
             from selenium.webdriver.chrome.options import Options
@@ -365,13 +365,7 @@ class ATrustLogin:
             return None
 
         url = urlparse(self.driver.current_url)
-
-        if any(keyword in url.fragment for keyword in self.must_be_logged_keywords):
-            return True
-        if any(keyword in url.fragment for keyword in self.must_not_logged_keywords):
-            return False
-
-        return "工作台" in self.driver.page_source and "本地密码" not in self.driver.page_source
+        return any(keyword in url.fragment for keyword in self.must_be_logged_keywords)
 
     def close(self):
         self.driver.quit()
