@@ -65,7 +65,26 @@ docker logs --tail 200 atrust
 
 ## 日志与磁盘空间
 
-容器浏览器输出保存到 `--data_dir/chrome.log`，每个文件约 5 MiB，最多保留当前文件和两个备份。HTTP 磁盘缓存参数为 64 MiB，媒体缓存参数为 32 MiB。浏览器临时配置目录在会话结束或初始化失败时清理；门户会话数据继续保存在 `--data_dir`。这些设置分别控制浏览器日志和缓存，不限制 aTrust 客户端自身日志及 Docker 日志的大小。
+容器浏览器输出保存到 `--data_dir/chrome.log`，默认每个文件约 20 MiB，总共保留五个文件，即当前文件和四个备份，总量约 100 MiB。使用 `--browser_log_size_mib` 设置每个文件的轮换大小，使用 `--browser_log_files` 设置包含当前文件的文件数量。这两个日志参数适用于容器模式。
+
+Chrome、Chromium 和 Edge 默认使用 256 MiB 的磁盘缓存容量提示，可通过 `--disk_cache_size_mib` 调整。大小参数均以 MiB 为单位，1 MiB 等于 1,048,576 字节。缓存容量属于浏览器缓存子系统的参考值，实际缓存总占用可能高于该值；浏览器运行内存、共享内存和整个用户配置目录的容量分别管理。参见 [Chromium 缓存大小说明](https://chromium.googlesource.com/chromium/src/+/HEAD/components/policy/resources/templates/policy_definitions/Miscellaneous/DiskCacheSize.yaml)。
+
+`--disk_cache_size_mib` 和 `--browser_log_size_mib` 必须为正整数，`--browser_log_files` 必须为不小于 `2` 的整数。参数会在等待客户端或启动浏览器前进行校验。
+
+例如，将磁盘缓存设置为 512 MiB，浏览器日志设置为每个文件约 50 MiB、共五个文件：
+
+```sh
+python3 src/main.py --portal_address="https://vpn.example.com" \
+  --disk_cache_size_mib=512 --browser_log_size_mib=50 --browser_log_files=5
+```
+
+容器中将这些参数添加到已有的 `ATRUST_OPTS`：
+
+```sh
+-e ATRUST_OPTS='--portal_address="https://vpn.example.com" --disk_cache_size_mib=512 --browser_log_size_mib=50 --browser_log_files=5'
+```
+
+浏览器临时配置目录在会话结束或初始化失败时清理；门户会话数据继续保存在 `--data_dir`。这些设置分别控制浏览器日志和缓存，不限制 aTrust 客户端自身日志及 Docker 日志的大小。
 
 为新容器配置 Docker 日志轮换：
 

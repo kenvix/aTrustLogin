@@ -62,6 +62,9 @@ python3 -m pip install -r requirements.txt
 - `--login_timeout`：可选。等待浏览器人工认证的最长时间，单位为秒，默认 `300`，必须大于零。
 - `--wait_atrust`：可选。是否等待 aTrust 在本机 TCP 54631 端口监听，默认 `True`。
 - `--client_timeout`：可选。等待客户端启动的最长时间，单位为秒，默认 `120`，必须大于零。
+- `--disk_cache_size_mib`：可选。浏览器磁盘缓存容量提示，单位为 MiB，默认 `256`，必须为正整数。
+- `--browser_log_size_mib`：可选。容器浏览器日志每个文件的轮换大小，单位为 MiB，默认 `20`，必须为正整数。
+- `--browser_log_files`：可选。容器浏览器日志文件数量，包含当前文件，默认 `5`，必须为不小于 `2` 的整数。
 
 密码登录示例：
 

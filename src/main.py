@@ -24,13 +24,24 @@ from selenium.webdriver.support.ui import WebDriverWait
 from browser_log import BrowserLog
 
 
+def validate_browser_resources(disk_cache_size_mib, browser_log_size_mib, browser_log_files):
+    """Validate cache and log settings before acquiring runtime resources."""
+    for name, value, minimum in (
+        ("disk_cache_size_mib", disk_cache_size_mib, 1),
+        ("browser_log_size_mib", browser_log_size_mib, 1),
+        ("browser_log_files", browser_log_files, 2),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer greater than or equal to {minimum}")
+
+
 class ATrustLoginStorage(BaseModel):
     cookies: List[Dict[str, Any]]
     local_storage: Dict[str, Any]
 
 
 class ATrustLogin:
-    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, login_timeout=300):
+    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, login_timeout=300, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5):
         self.initialized = False
         self.container_mode = container_mode
         self.driver = None
@@ -42,6 +53,10 @@ class ATrustLogin:
         self.portal_origin(portal_address)
         if login_timeout <= 0:
             raise ValueError("login_timeout must be greater than zero")
+        validate_browser_resources(disk_cache_size_mib, browser_log_size_mib, browser_log_files)
+        self.disk_cache_size_mib = disk_cache_size_mib
+        self.browser_log_size_mib = browser_log_size_mib
+        self.browser_log_files = browser_log_files
         self.login_timeout = login_timeout
         os.makedirs(data_dir, exist_ok=True)
         self.data_dir = data_dir
@@ -80,8 +95,8 @@ class ATrustLogin:
             "--ignore-certificate-errors", "--ignore-ssl-errors", "--no-sandbox",
             "--lang=zh-CN", "--disable-gpu", "--disable-extensions",
             "--disable-web-security", "--allow-insecure-localhost",
-            "--window-size=896,672", "--disk-cache-size=67108864",
-            "--media-cache-size=33554432",
+            "--window-size=896,672",
+            f"--disk-cache-size={self.disk_cache_size_mib * 1024 * 1024}",
         ]
         if self.container_mode:
             from selenium.webdriver.chrome.options import Options
@@ -96,7 +111,9 @@ class ATrustLogin:
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
             self._browser_log = BrowserLog(
-                self.chrome_process.stdout, os.path.join(self.data_dir, "chrome.log")
+                self.chrome_process.stdout, os.path.join(self.data_dir, "chrome.log"),
+                max_bytes=self.browser_log_size_mib * 1024 * 1024,
+                backup_count=self.browser_log_files - 1,
             )
             deadline = time.monotonic() + 60
             while True:
@@ -447,11 +464,12 @@ class ATrustLogin:
                 time.sleep(min(5, max(0, deadline - time.monotonic())))
 
 
-def main(portal_address, username=None, password=None, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, login_timeout=300, client_timeout=120):
+def main(portal_address, username=None, password=None, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, login_timeout=300, client_timeout=120, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5):
     if (username is None) != (password is None):
         raise ValueError("Provide both username and password, or omit both for browser login")
     if login_timeout <= 0 or client_timeout <= 0:
         raise ValueError("login_timeout and client_timeout must be greater than zero")
+    validate_browser_resources(disk_cache_size_mib, browser_log_size_mib, browser_log_files)
     ATrustLogin.portal_origin(portal_address)
     if wait_atrust:
         ATrustLogin.wait_for_port(54631, timeout=client_timeout)
@@ -460,6 +478,8 @@ def main(portal_address, username=None, password=None, totp_key=None, cookie_tid
         cookie_sig=cookie_sig, driver_type=driver_type, driver_path=driver_path,
         browser_path=browser_path, interactive=interactive,
         container_mode=container_mode, login_timeout=login_timeout,
+        disk_cache_size_mib=disk_cache_size_mib,
+        browser_log_size_mib=browser_log_size_mib, browser_log_files=browser_log_files,
     )
     try:
         while True:

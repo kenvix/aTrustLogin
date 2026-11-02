@@ -56,6 +56,9 @@ python3 -m pip install -r requirements.txt
 - `--login_timeout`: Maximum wait for browser-assisted authentication in seconds, default `300`; must be positive.
 - `--wait_atrust`: Wait for the local aTrust client on TCP port 54631, default `True`.
 - `--client_timeout`: Maximum client startup wait in seconds, default `120`; must be positive.
+- `--disk_cache_size_mib`: Browser disk-cache size hint in MiB, default `256`; must be a positive integer.
+- `--browser_log_size_mib`: Container browser-log rotation size per file in MiB, default `20`; must be a positive integer.
+- `--browser_log_files`: Number of container browser-log files, including the current file, default `5`; must be an integer of at least `2`.
 
 Password login:
 
@@ -123,7 +126,17 @@ These parameters are optional. The program also saves session state after a succ
 
 ### Logs and Client Startup
 
-Container browser output is rotated in `data_dir/chrome.log`, with approximately 5 MiB per file and two backups. Browser disk and media caches are configured to 64 MiB and 32 MiB. Owned temporary browser profiles are removed when the session closes or initialization fails. These settings do not limit the aTrust client's own logs or Docker's logs.
+Container browser output is rotated in `data_dir/chrome.log`, with approximately 20 MiB per file and five files in total: the current file and four backups, approximately 100 MiB combined. Configure the per-file size with `--browser_log_size_mib` and the total file count with `--browser_log_files`. These log settings apply to container mode.
+
+Chrome, Chromium, and Edge use a disk-cache size hint of 256 MiB by default. Change it with `--disk_cache_size_mib`. One MiB is 1,048,576 bytes. This is a cache-size hint, not a browser memory limit or a quota for the entire browser profile; see the [Chromium cache-size documentation](https://chromium.googlesource.com/chromium/src/+/HEAD/components/policy/resources/templates/policy_definitions/Miscellaneous/DiskCacheSize.yaml).
+
+For a 512 MiB cache and five browser-log files of approximately 50 MiB each, add the following options to the command or to `ATRUST_OPTS`:
+
+```sh
+--disk_cache_size_mib=512 --browser_log_size_mib=50 --browser_log_files=5
+```
+
+Owned temporary browser profiles are removed when the session closes or initialization fails. These settings do not limit the aTrust client's own logs or Docker's logs.
 
 The Docker example configures the `local` logging driver with rotation. To change logging options for an existing container, recreate it while preserving its persistent volume. See [Docker local logging](https://docs.docker.com/engine/logging/drivers/local/).
 

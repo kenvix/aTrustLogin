@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 
 
 class BrowserLog:
-    def __init__(self, stream, path, max_bytes=5 * 1024 * 1024, backup_count=2):
+    def __init__(self, stream, path, max_bytes=20 * 1024 * 1024, backup_count=4):
         self.stream = stream
         self.handler = RotatingFileHandler(
             path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"

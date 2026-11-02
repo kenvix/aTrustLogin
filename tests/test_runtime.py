@@ -146,8 +146,7 @@ class RuntimeTests(unittest.TestCase):
                 login = ATrustLogin("https://vpn.example.test", data_dir=directory)
                 selected = chrome if expected == "Chrome" else edge
                 options = selected.call_args.kwargs["options"]
-                self.assertIn("--disk-cache-size=67108864", options.arguments)
-                self.assertIn("--media-cache-size=33554432", options.arguments)
+                self.assertIn("--disk-cache-size=268435456", options.arguments)
                 profile_path = login._profile.name
                 login.close()
                 self.assertFalse(Path(profile_path).exists())
