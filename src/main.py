@@ -1,9 +1,10 @@
-import json
 import os.path
 import pickle
 import platform
+import signal
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.request
 from typing import Dict, List, Any
@@ -13,87 +14,110 @@ import pyotp
 from loguru import logger
 from pydantic import BaseModel
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import (
+    InvalidSessionIdException, NoSuchWindowException, TimeoutException, WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from browser_log import BrowserLog
 
 
 class ATrustLoginStorage(BaseModel):
     cookies: List[Dict[str, Any]]
     local_storage: Dict[str, Any]
 
+
 class ATrustLogin:
-    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False):
+    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, login_timeout=300):
         self.initialized = False
         self.container_mode = container_mode
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir, exist_ok=True)
-        self.data_dir = data_dir
-        self.interactive = interactive
+        self.driver = None
+        self.chrome_process = None
+        self._browser_log = None
+        self._profile = None
         self.portal_address = portal_address
         self.portal_host = urlparse(portal_address).hostname
+        self.portal_origin(portal_address)
+        if login_timeout <= 0:
+            raise ValueError("login_timeout must be greater than zero")
+        self.login_timeout = login_timeout
+        os.makedirs(data_dir, exist_ok=True)
+        self.data_dir = data_dir
+        self.interactive = interactive
         self.cookie_tid = cookie_tid
         self.cookie_sig = cookie_sig
-
         self.must_be_logged_keywords = ['app_center', 'user_info', 'app_apply', 'device_manage']
-        # self.must_not_logged_keywords = ['login', 'totpAuth', 'captcha', 'page_auth_trust_terminal', 'smsAuth']
 
+        try:
+            self._start_browser(driver_path, browser_path, driver_type)
+            self.configure_client_access()
+            self.wait = WebDriverWait(self.driver, 10)
+        except BaseException:
+            self.close()
+            raise
+        logger.debug("Selenium init successfully.")
+
+    @staticmethod
+    def portal_origin(address):
+        portal = urlparse(address)
+        if portal.scheme not in ("http", "https") or not portal.hostname:
+            raise ValueError("portal_address must be an HTTP or HTTPS URL")
+        port = portal.port or (443 if portal.scheme == "https" else 80)
+        return portal.scheme, portal.hostname, port
+
+    def is_portal_page(self):
+        try:
+            return self.portal_origin(self.driver.current_url) == self.portal_origin(self.portal_address)
+        except ValueError:
+            return False
+
+    def _start_browser(self, driver_path, browser_path, driver_type):
+        self._profile = tempfile.TemporaryDirectory(prefix="atrust-chrome-")
+        arguments = [
+            f"--user-data-dir={self._profile.name}",
+            "--ignore-certificate-errors", "--ignore-ssl-errors", "--no-sandbox",
+            "--lang=zh-CN", "--disable-gpu", "--disable-extensions",
+            "--disable-web-security", "--allow-insecure-localhost",
+            "--window-size=896,672", "--disk-cache-size=67108864",
+            "--media-cache-size=33554432",
+        ]
         if self.container_mode:
             from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
 
-            DEBUG_PORT = "55555"
-            PROFILE_DIR = "Default"
-
+            debug_port = 55555
             binary_location = browser_path or "/usr/bin/chromium"
-            chrome_data_dir = os.path.join("/tmp", "chrome-data")
-            log_file = os.path.join(chrome_data_dir, "chrome.log")
-            os.makedirs(chrome_data_dir, exist_ok=True)
-
-            logger.info(f"Starting Chrome with debug port {DEBUG_PORT}")
-            self.chrome_process = subprocess.Popen([
-                    binary_location,
-                    f"--remote-debugging-port={DEBUG_PORT}",
-                    f"--user-data-dir={chrome_data_dir}",
-                    f"--profile-directory={PROFILE_DIR}",
-                    "--ignore-certificate-errors",
-                    "--ignore-ssl-errors", 
-                    "--no-sandbox", 
-                    "--lang=zh-CN", 
-                    "--disable-gpu", 
-                    "--disable-extensions",
-                    "--disable-web-security",
-                    "--allow-insecure-localhost",
-                    "--window-size=896,672",
-                    "data:,"
-                ], stdout=open(log_file, "w"), stderr=subprocess.STDOUT
+            logger.info("Starting Chrome with debug port {}", debug_port)
+            self.chrome_process = subprocess.Popen(
+                [binary_location, f"--remote-debugging-port={debug_port}",
+                 "--profile-directory=Default", *arguments, "data:,"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
-
-            logger.info(f"Chrome started, PID {self.chrome_process.pid}, waiting for DevTools ...")
+            self._browser_log = BrowserLog(
+                self.chrome_process.stdout, os.path.join(self.data_dir, "chrome.log")
+            )
+            deadline = time.monotonic() + 60
             while True:
                 if self.chrome_process.poll() is not None:
                     raise RuntimeError(f"Chrome exited with code {self.chrome_process.returncode}")
                 try:
-                    urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json/version")
-                    logger.info("DevTools ready.")
-                    break
-                except:
-                    time.sleep(3)
-
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{debug_port}/json/version", timeout=2
+                    ):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Chrome DevTools did not become ready within 60 seconds")
+                    time.sleep(1)
             self.options = Options()
-            self.options.debugger_address = f"127.0.0.1:{DEBUG_PORT}"
-            self.driver = webdriver.Chrome(options=self.options)
-
+            self.options.debugger_address = f"127.0.0.1:{debug_port}"
+            self.driver = webdriver.Chrome(service=Service(driver_path), options=self.options)
         else:
             if driver_type is None:
-                system = platform.system()
-                if system == "Windows":
-                    driver_type = "edge"
-                else:
-                    driver_type = "chrome"
-
-            logger.debug(f"Driver: {driver_type}: {driver_path}")
-
+                driver_type = "edge" if platform.system() == "Windows" else "chrome"
+            logger.debug("Driver: {}: {}", driver_type, driver_path)
             if driver_type == "edge":
                 from selenium.webdriver.edge.options import Options
                 from selenium.webdriver.edge.service import Service
@@ -102,88 +126,51 @@ class ATrustLogin:
                 from selenium.webdriver.chrome.options import Options
                 from selenium.webdriver.chrome.service import Service
                 driver_cls = webdriver.Chrome
-
             self.options = Options()
-            self.options.add_argument('--profile-directory=ATrustLogin')
-            self.options.add_argument("--ignore-certificate-errors")
-            self.options.add_argument("--ignore-ssl-errors")
-            self.options.add_argument("--no-sandbox")
-            self.options.add_argument("--lang=zh-CN")
-            self.options.add_argument("--disable-gpu")
-            self.options.add_argument("--disable-extensions")
-            self.options.add_argument("--disable-web-security")
-            self.options.add_argument("--allow-insecure-localhost")
-            self.options.add_argument("--window-size=896,672")
+            for argument in arguments:
+                self.options.add_argument(argument)
+            self.options.add_argument("--profile-directory=ATrustLogin")
             self.options.add_experimental_option("prefs", {"intl.accept_languages": "zh-CN"})
             if browser_path is not None:
                 self.options.binary_location = browser_path
             self.driver = driver_cls(service=Service(driver_path), options=self.options)
 
-        self.configure_client_access()
-        self.wait = WebDriverWait(self.driver, 10)
-        logger.debug("Selenium init successfully.")
-
     def configure_client_access(self):
         """Allow the configured portal to contact the local aTrust client."""
         portal = urlparse(self.portal_address)
-        if portal.scheme not in ("http", "https") or not portal.hostname:
-            raise ValueError("portal_address must be an HTTP or HTTPS URL")
+        self.portal_origin(self.portal_address)
         host = portal.hostname
         if ":" in host:
             host = f"[{host}]"
         origin = f"{portal.scheme}://{host}"
         if portal.port is not None:
             origin += f":{portal.port}"
-
-        # Prefer loopback-only access; older Chromium uses a combined permission.
         for permission in ("loopback-network", "local-network-access"):
             try:
                 self.driver.execute_cdp_cmd("Browser.setPermission", {
                     "permission": {"name": permission},
-                    "setting": "granted",
-                    "origin": origin,
+                    "setting": "granted", "origin": origin,
                 })
                 logger.debug("Granted {} permission for {}", permission, origin)
                 return True
-            except WebDriverException as exc:
-                logger.debug("Could not set {} permission: {}", permission, exc.msg)
-
+            except WebDriverException:
+                logger.debug("Could not set {} permission", permission)
         logger.warning(
             "Could not configure browser access to the local aTrust client. "
-            "If client detection fails, allow local network access for the "
-            "portal in the browser site settings."
+            "Allow local network access for the portal in the browser site settings."
         )
         return False
 
-    # 打开默认的portal地址并等待sangfor_main_auth_container出现
     def open_portal(self):
         self.driver.get(self.portal_address)
-
-        if self.driver.get_cookie("language"):
-            self.driver.delete_cookie("language")
-        if self.driver.get_cookie("lang"):
-            self.driver.delete_cookie("lang")
-
-        self.driver.add_cookie(
-            {
-                "name": "language",
-                "value": "zh-CN",
-                "domain": self.portal_host,
-                "path": "/",
-            }
-        )
-
-        self.driver.add_cookie(
-            {
-                "name": "lang",
-                "value": "zh-cn",
-                "domain": self.portal_host,
-                "path": "/",
-            }
-        )
+        if not self.is_portal_page():
+            return
+        for name, value in (("language", "zh-CN"), ("lang", "zh-cn")):
+            self.driver.delete_cookie(name)
+            self.driver.add_cookie({"name": name, "value": value, "path": "/"})
 
     def wait_login_page(self):
-        # 使用显式等待sangfor_main_auth_container元素出现
+        self.wait.until(lambda d: self.is_portal_page())
         self.wait.until(EC.presence_of_element_located((By.ID, "sangfor_main_auth_container")))
         self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "login-panel")))
         self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -196,66 +183,44 @@ class ATrustLogin:
     def delay_loading():
         time.sleep(5)
 
-    # 递归查找具有指定placeholder的前两个非hidden类型的input框
     def find_input_fields(self, element, inputs_found=None):
         if inputs_found is None:
             inputs_found = []
-
-        # 检查当前节点是否是符合条件的input框
         if element.tag_name == "input":
             placeholder = element.get_attribute("placeholder")
             input_type = element.get_attribute("type")
-            # 确保input具有指定的placeholder，并且不是hidden类型
             if placeholder and ("账号" in placeholder or "account" in placeholder.lower() or "密码" in placeholder or "password" in placeholder.lower()) and input_type != "hidden" and element.is_displayed() and element.is_enabled():
                 inputs_found.append(element)
-                # 如果找到两个符合条件的input框就返回
                 if len(inputs_found) == 2:
                     return inputs_found
-
-        # 递归遍历所有子节点
-        child_elements = element.find_elements(By.XPATH, "./*")
-        for child in child_elements:
+        for child in element.find_elements(By.XPATH, "./*"):
             result = self.find_input_fields(child, inputs_found)
             if result and len(result) == 2:
                 return result
         return inputs_found
 
-    # 输入用户名和密码
     def enter_credentials(self, username, password):
+        if not self.is_portal_page():
+            return False
         try:
             element = self.driver.find_element(By.XPATH, "//div[contains(@class, 'server-name') and contains(text(), '本地密码')]")
             if element.is_displayed():
                 self.delay_input()
                 self.scroll_and_click(element)
-        except:
+        except WebDriverException:
             pass
-
-        # 找到包含ID=sangfor_main_auth_container的div
         main_auth_div = self.driver.find_element(By.ID, "sangfor_main_auth_container")
-
-        # 递归查找前两个input框
         input_fields = self.find_input_fields(main_auth_div)
-
-        if len(input_fields) >= 2:
-            username_input = input_fields[0]
-            password_input = input_fields[1]
-
-            # 输入用户名和密码
-            self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(username_input)))
+        if len(input_fields) < 2:
+            return False
+        for field, value in zip(input_fields, (username, password)):
+            self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(field)))
             self.delay_input()
-            username_input.clear()
-            username_input.send_keys(username)
-
-            self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(password_input)))
-            self.delay_input()
-            password_input.clear()
-            password_input.send_keys(password)
-
-            self.select_login_checkbox(main_auth_div)
-
-            logger.debug("Filled username and password")
-        else:
-            logger.info("未找到用户名或密码输入框")
+            field.clear()
+            field.send_keys(value)
+        self.select_login_checkbox(main_auth_div)
+        logger.debug("Filled username and password")
+        return True
 
     def select_login_checkbox(self, main_auth_div):
         """Select the first available login checkbox through its visible control."""
@@ -276,222 +241,263 @@ class ATrustLogin:
                 self.wait.until(EC.element_to_be_selected(checkbox))
             return
 
-    # 查找并点击登录按钮
     def click_login_button(self):
-        # 在div class=login-panel中寻找包含“登录”或“login”或“log in”的按钮
         login_panel = self.driver.find_element(By.CLASS_NAME, "login-panel")
-        buttons = login_panel.find_elements(By.TAG_NAME, "button")
-
-        for button in buttons:
+        for button in login_panel.find_elements(By.TAG_NAME, "button"):
             button_text = button.text.lower()
             if "登录" in button_text or "login" in button_text or "log in" in button_text:
                 self.scroll_and_click(button)
                 return
-        logger.info("未找到符合条件的登录按钮")
+        raise RuntimeError("No login button found in the portal login panel")
 
     def load_storage(self):
-        # 从pickle文件中加载存储的数据
+        if not self.is_portal_page():
+            return False
+        restored = False
         try:
-            if os.path.exists(os.path.join(self.data_dir, "ATrustLoginStorage.pkl")):
-                with open(os.path.join(self.data_dir, "ATrustLoginStorage.pkl"), "rb") as f:
-                    data = pickle.load(f)
-                    # 从cookies中加载cookie
-                    for cookie in data.cookies:
-                        self.driver.delete_cookie(cookie['name'])
-                        self.driver.add_cookie(cookie)
-                    # 从local_storage中加载local storage
-                    for key, value in data.local_storage.items():
-                        self.driver.execute_script(f"window.localStorage.setItem('{key}', '{value}')")
-                    logger.info("Loaded storage data")
+            with open(os.path.join(self.data_dir, "ATrustLoginStorage.pkl"), "rb") as f:
+                data = pickle.load(f)
+            for cookie in data.cookies:
+                if cookie.get("expiry", float("inf")) <= time.time():
+                    continue
+                try:
+                    self.driver.delete_cookie(cookie['name'])
+                    self.driver.add_cookie(cookie)
+                    restored = True
+                except WebDriverException:
+                    logger.warning("A stored cookie could not be restored")
+            for key, value in data.local_storage.items():
+                self.driver.execute_script("window.localStorage.setItem(arguments[0], arguments[1]);", key, value)
+                restored = True
+            logger.info("Loaded storage data")
         except FileNotFoundError:
-            logger.info("未找到存储的数据")
-
+            pass
+        except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError, TypeError):
+            logger.warning("Stored session data could not be read; continuing with browser login")
         self.set_cli_cookie(force=False)
+        return restored or bool(self.cookie_tid or self.cookie_sig)
 
     def scroll_to(self, element):
         self.driver.execute_script("arguments[0].scrollIntoView();", element)
 
     def scroll_and_click(self, element):
-        self.driver.execute_script("arguments[0].scrollIntoView();", element)
+        self.scroll_to(element)
         element.click()
         return element
 
     def set_cli_cookie(self, force=False):
-        # --cookie_tid / --cookie_sig are optional. Passing None to add_cookie()
-        # makes chromedriver fail with "invalid argument: missing 'value'",
-        # which aborts init() and leaves the autologin retrying forever.
-        if self.cookie_tid and (force or not self.driver.get_cookie("tid")):
-            self.driver.delete_cookie("tid")
-            self.driver.add_cookie({
-                "name": "tid",
-                "value": self.cookie_tid,
-                "domain": self.portal_host,
-                "path": "/"
-            })
+        if not self.is_portal_page():
+            return
+        for name, value in (("tid", self.cookie_tid), ("tid.sig", self.cookie_sig)):
+            if value and (force or not self.driver.get_cookie(name)):
+                self.driver.delete_cookie(name)
+                self.driver.add_cookie({
+                    "name": name, "value": value, "domain": self.portal_host, "path": "/",
+                })
 
-        if self.cookie_sig and (force or not self.driver.get_cookie("tid.sig")):
-            self.driver.delete_cookie("tid.sig")
-            self.driver.add_cookie({
-                "name": "tid.sig",
-                "value": self.cookie_sig,
-                "domain": self.portal_host,
-                "path": "/"
-            })
+    def wait_for_manual_login(self):
+        logger.info("Complete login in the browser or VNC; waiting up to {} seconds", self.login_timeout)
+        WebDriverWait(self.driver, self.login_timeout).until(lambda d: self.is_logged())
+        self.update_storage()
+        return True
 
-    def require_interact(self):
-        if self.interactive:
-            input("Press any key to continue")
-        else:
-            raise Exception("User Interact required")
+    def require_interact(self, condition=None):
+        if not self.interactive:
+            raise RuntimeError("Browser interaction required; use --interactive=True")
+        logger.info("Complete verification in the browser or VNC")
+        WebDriverWait(self.driver, self.login_timeout).until(condition or (lambda d: self.is_logged()))
 
     def init(self):
         if not self.initialized:
             self.open_portal()
-            self.wait_login_page()
+            self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             self.delay_loading()
-            self.load_storage()
+            if self.load_storage():
+                self.driver.refresh()
             self.initialized = True
 
-    def login(self, username, password, totp_key, **kwargs):
+    def login(self, username=None, password=None, totp_key=None, **kwargs):
+        if (username is None) != (password is None):
+            raise ValueError("Provide both username and password, or omit both for browser login")
         self.init()
-
         if self.is_logged():
             logger.info("Already logged in")
             return True
-
-        self.enter_credentials(username=username, password=password)
+        if username is None:
+            return self.wait_for_manual_login()
+        try:
+            self.wait_login_page()
+        except TimeoutException:
+            if self.interactive:
+                return self.wait_for_manual_login()
+            raise
+        if not self.enter_credentials(username=username, password=password):
+            if self.interactive:
+                return self.wait_for_manual_login()
+            raise RuntimeError("No password login form found; omit credentials for SSO login")
         self.delay_input()
         self.click_login_button()
-
         logger.info("Performed basic login action")
-
         self.delay_loading()
-        logger.debug("Checking captcha ...")
-
         if "图形校验码" in self.driver.page_source:
             if 'is_retried' not in kwargs:
                 self.set_cli_cookie(force=True)
                 self.driver.refresh()
-                self.login( username, password, totp_key, is_retried=True)
-                return
-            else:
-                logger.warning("Need to handle captcha, press any key to continue")
-                self.require_interact()
-
+                return self.login(username, password, totp_key, is_retried=True)
+            self.require_interact(lambda d: self.is_logged() or "图形校验码" not in d.page_source)
         if "TOTP" in self.driver.page_source and "二次认证" in self.driver.page_source:
-            if totp_key is not None:
-                totp = pyotp.TOTP(totp_key)
-                totp_code = totp.now()
-
-                logger.info(f"TOTP code: {totp_code}")
+            if totp_key:
+                totp_code = pyotp.TOTP(totp_key).now()
                 totp_input = self.driver.find_element(By.XPATH, "//input[contains(@class, 'totp')]")
-
                 self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(totp_input)))
                 self.delay_input()
+                totp_input.clear()
                 totp_input.send_keys(totp_code)
-
                 submit_button = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit'], input[type='submit']")
-                self.wait.until(EC.element_to_be_clickable(submit_button))
-                self.delay_input()
-                self.scroll_and_click(submit_button)
-                logger.info(f"Performed TOTP login action with code: {totp_code}")
+                self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(submit_button)))
+                logger.info("Submitted TOTP verification")
                 self.delay_loading()
             else:
-                logger.info("Need to handle TOTP, press any key to continue")
                 self.require_interact()
-
-        logger.info("Performed verification code login action")
-
         if self.is_logged():
             logger.info("Login Success")
             self.update_storage()
             return True
+        if self.interactive:
+            return self.wait_for_manual_login()
+        return False
 
     def is_logged(self):
-        """
-        检查是否已经登录
-        :return: None if not sure, True if logged, False if not logged
-        """
-
-        if self.driver.current_url.startswith('about:'):
-            return None
-
-        url = urlparse(self.driver.current_url)
-        return any(keyword in url.fragment for keyword in self.must_be_logged_keywords)
+        if not self.is_portal_page():
+            return False
+        segments = urlparse(self.driver.current_url).fragment.split("?", 1)[0].strip("/").split("/")
+        return any(segment in self.must_be_logged_keywords for segment in segments)
 
     def close(self):
-        self.driver.quit()
-        if self.container_mode and hasattr(self, 'chrome_process') and self.chrome_process.poll() is None:
-            self.chrome_process.terminate()
+        try:
+            driver = getattr(self, "driver", None)
+            self.driver = None
+            if driver is not None:
+                try:
+                    driver.quit()
+                except WebDriverException:
+                    logger.warning("WebDriver could not close normally")
+        finally:
             try:
-                self.chrome_process.wait(timeout=5)
-            except:
-                self.chrome_process.kill()
-                self.chrome_process.wait()
+                process = getattr(self, "chrome_process", None)
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            finally:
+                self.chrome_process = None
+                browser_log = getattr(self, "_browser_log", None)
+                if browser_log is not None:
+                    browser_log.close()
+                    self._browser_log = None
+                profile = getattr(self, "_profile", None)
+                if profile is not None:
+                    profile.cleanup()
+                    self._profile = None
 
     def __enter__(self):
         return self
 
     def update_storage(self):
+        if not self.is_portal_page():
+            return
         data = ATrustLoginStorage(
             cookies=self.driver.get_cookies(),
             local_storage=self.driver.execute_script("return window.localStorage")
         )
-
-        # save with pickle
-        with open(os.path.join(self.data_dir, "ATrustLoginStorage.pkl"), "wb") as f:
-            pickle.dump(data, f)
+        path = os.path.join(self.data_dir, "ATrustLoginStorage.pkl")
+        fd, temporary = tempfile.mkstemp(dir=self.data_dir, prefix=".atrust-storage-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(data, f)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
     @staticmethod
-    def wait_for_port(port, host='localhost'):
+    def wait_for_port(port, host='localhost', timeout=120):
+        if timeout <= 0:
+            raise ValueError("client_timeout must be greater than zero")
+        deadline = time.monotonic() + timeout
         while True:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                try:
-                    s.connect((host, port))
-                    logger.info(f"Detected aTrust is listening on port {port}")
-                    s.close()
-                    break
-                except (socket.timeout, ConnectionRefusedError):
-                    logger.info(f"aTrust Port {port} is not yet being listened on. Waiting for aTrust start ...")
-                    ATrustLogin.delay_loading()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"aTrust did not listen on {host}:{port} within {timeout} seconds. "
+                    "Check the aTrust client process, client version, and client startup logs."
+                )
+            try:
+                with socket.create_connection((host, port), timeout=min(1, remaining)):
+                    logger.info("Detected aTrust is listening on port {}", port)
+                    return
+            except OSError:
+                logger.info("Waiting for aTrust on {}:{}", host, port)
+                time.sleep(min(5, max(0, deadline - time.monotonic())))
 
-def main(portal_address, username, password, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False):
-    logger.info("Opening Web Browser")
 
+def main(portal_address, username=None, password=None, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, login_timeout=300, client_timeout=120):
+    if (username is None) != (password is None):
+        raise ValueError("Provide both username and password, or omit both for browser login")
+    if login_timeout <= 0 or client_timeout <= 0:
+        raise ValueError("login_timeout and client_timeout must be greater than zero")
+    ATrustLogin.portal_origin(portal_address)
     if wait_atrust:
-        ATrustLogin.wait_for_port(54631)
-
-    # 创建ATrustLogin对象
-    at = ATrustLogin(data_dir=data_dir, portal_address=portal_address, cookie_tid=cookie_tid, cookie_sig=cookie_sig, driver_type=driver_type, driver_path=driver_path, browser_path=browser_path, interactive=interactive, container_mode=container_mode)
-
-    at.init()
-
-    while True:
-        try:
-            if not at.is_logged():
-                logger.info("Session lost. Trying to login again ...")
-                at.open_portal()
-                at.delay_loading()
-                if at.login(username=username, password=password, totp_key=totp_key) is True:
-                    at.delay_loading()
-                    at.delay_loading()
-
-            if keepalive <= 0:
-                at.close()
-                exit(0)
-            else:
+        ATrustLogin.wait_for_port(54631, timeout=client_timeout)
+    at = ATrustLogin(
+        data_dir=data_dir, portal_address=portal_address, cookie_tid=cookie_tid,
+        cookie_sig=cookie_sig, driver_type=driver_type, driver_path=driver_path,
+        browser_path=browser_path, interactive=interactive,
+        container_mode=container_mode, login_timeout=login_timeout,
+    )
+    try:
+        while True:
+            try:
+                if not at.initialized or not at.is_logged():
+                    if at.initialized:
+                        at.open_portal()
+                        at.delay_loading()
+                    success = at.login(username=username, password=password, totp_key=totp_key)
+                else:
+                    success = True
+                if keepalive <= 0:
+                    if not success:
+                        raise RuntimeError("Login did not complete")
+                    return
                 time.sleep(keepalive)
                 at.open_portal()
                 at.delay_loading()
-        except Exception as e:
-            logger.error("An error occurred when trying to login, retrying ...")
-            logger.exception(e)
-            at.delay_loading()
+            except (InvalidSessionIdException, NoSuchWindowException):
+                raise
+            except Exception as exc:
+                if keepalive <= 0:
+                    raise
+                logger.error("Login attempt failed ({}); retrying after 5 seconds", type(exc).__name__)
+                at.delay_loading()
+    finally:
+        at.close()
+
 
 if __name__ == "__main__":
     from fire import Fire
-    Fire(main)
+
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        Fire(main)
+    except Exception as exc:
+        logger.error("Autologin stopped: {}: {}", type(exc).__name__, str(exc))
+        raise SystemExit(1)

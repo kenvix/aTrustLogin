@@ -75,12 +75,12 @@ class ClientPermissionTests(unittest.TestCase):
                 driver = MagicMock()
                 process = MagicMock()
                 process.poll.return_value = None
+                process.stdout.read.return_value = b""
                 with tempfile.TemporaryDirectory() as data_dir, \
                         patch("main.webdriver.Chrome", return_value=driver), \
                         patch("main.webdriver.Edge", return_value=driver), \
                         patch("main.subprocess.Popen", return_value=process), \
-                        patch("main.urllib.request.urlopen"), \
-                        patch("builtins.open", MagicMock()):
+                        patch("main.urllib.request.urlopen"):
                     login = ATrustLogin("https://vpn.example.test", driver_type=driver_type,
                                        container_mode=container_mode, data_dir=data_dir)
                     driver.execute_cdp_cmd.assert_called_once()
