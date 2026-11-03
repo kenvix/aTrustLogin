@@ -13,6 +13,7 @@ import pyotp
 from loguru import logger
 from pydantic import BaseModel
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -118,8 +119,41 @@ class ATrustLogin:
                 self.options.binary_location = browser_path
             self.driver = driver_cls(service=Service(driver_path), options=self.options)
 
+        self.configure_client_access()
         self.wait = WebDriverWait(self.driver, 10)
         logger.debug("Selenium init successfully.")
+
+    def configure_client_access(self):
+        """Allow the configured portal to contact the local aTrust client."""
+        portal = urlparse(self.portal_address)
+        if portal.scheme not in ("http", "https") or not portal.hostname:
+            raise ValueError("portal_address must be an HTTP or HTTPS URL")
+        host = portal.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        origin = f"{portal.scheme}://{host}"
+        if portal.port is not None:
+            origin += f":{portal.port}"
+
+        # Prefer loopback-only access; older Chromium uses a combined permission.
+        for permission in ("loopback-network", "local-network-access"):
+            try:
+                self.driver.execute_cdp_cmd("Browser.setPermission", {
+                    "permission": {"name": permission},
+                    "setting": "granted",
+                    "origin": origin,
+                })
+                logger.debug("Granted {} permission for {}", permission, origin)
+                return True
+            except WebDriverException as exc:
+                logger.debug("Could not set {} permission: {}", permission, exc.msg)
+
+        logger.warning(
+            "Could not configure browser access to the local aTrust client. "
+            "If client detection fails, allow local network access for the "
+            "portal in the browser site settings."
+        )
+        return False
 
     # 打开默认的portal地址并等待sangfor_main_auth_container出现
     def open_portal(self):
@@ -172,7 +206,7 @@ class ATrustLogin:
             placeholder = element.get_attribute("placeholder")
             input_type = element.get_attribute("type")
             # 确保input具有指定的placeholder，并且不是hidden类型
-            if placeholder and ("账号" in placeholder or "account" in placeholder.lower() or "密码" in placeholder or "password" in placeholder.lower()) and input_type != "hidden":
+            if placeholder and ("账号" in placeholder or "account" in placeholder.lower() or "密码" in placeholder or "password" in placeholder.lower()) and input_type != "hidden" and element.is_displayed() and element.is_enabled():
                 inputs_found.append(element)
                 # 如果找到两个符合条件的input框就返回
                 if len(inputs_found) == 2:
@@ -217,15 +251,30 @@ class ATrustLogin:
             password_input.clear()
             password_input.send_keys(password)
 
-            checkbox = main_auth_div.find_element(By.XPATH, "//input[@type='checkbox']")
-            # 检查checkbox是否已经被选中
-            if not checkbox.is_selected():
-                self.delay_input()
-                self.scroll_and_click(checkbox)  # 如果没有选中，就点击选中
+            self.select_login_checkbox(main_auth_div)
 
             logger.debug("Filled username and password")
         else:
             logger.info("未找到用户名或密码输入框")
+
+    def select_login_checkbox(self, main_auth_div):
+        """Select the first available login checkbox through its visible control."""
+        checkboxes = main_auth_div.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+        for checkbox in checkboxes:
+            if not checkbox.is_enabled():
+                continue
+            labels = self.driver.execute_script(
+                "return Array.from(arguments[0].labels || []);", checkbox
+            )
+            targets = labels + [checkbox]
+            target = next((item for item in targets if item.is_displayed()), None)
+            if target is None:
+                continue
+            if not checkbox.is_selected():
+                self.delay_input()
+                self.scroll_and_click(self.wait.until(EC.element_to_be_clickable(target)))
+                self.wait.until(EC.element_to_be_selected(checkbox))
+            return
 
     # 查找并点击登录按钮
     def click_login_button(self):
